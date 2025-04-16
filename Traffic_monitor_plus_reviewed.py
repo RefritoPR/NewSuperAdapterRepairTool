@@ -1,30 +1,44 @@
-# Hardened version of Traffic_monitor_plus.py
-
 import os
 import re
 import json
-import time
 import logging
 import smtplib
 import sqlite3
 from datetime import datetime
 from email.message import EmailMessage
+from typing import List, Dict, Any
 from mac_vendor_lookup import MacLookup
 from scapy.all import ARP, sniff
-import subprocess
 from cryptography.fernet import Fernet
+import subprocess
 
-# Load environment variables
-EMAIL_USERNAME = os.getenv("EMAIL_USERNAME")
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
-SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.example.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
-ALERT_RECIPIENT = os.getenv("ALERT_RECIPIENT", "admin@example.com")
-FERNET_KEY = os.getenv("FERNET_KEY")  # Must be securely set
+# Constants
 BLACKLIST_FILE = "blacklist.json.enc"
 DB_FILE = "logs.db"
 ARP_REQUEST_THRESHOLD = 10
-INTERFACE = os.getenv("NETWORK_INTERFACE", "eth0")
+DEFAULT_INTERFACE = "eth0"
+
+# Modules
+class Config:
+    """Class to handle environment variable configuration"""
+    def __init__(self):
+        self.EMAIL_USERNAME = os.getenv("EMAIL_USERNAME")
+        self.EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+        self.SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.example.com")
+        self.SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+        self.ALERT_RECIPIENT = os.getenv("ALERT_RECIPIENT", "admin@example.com")
+        self.FERNET_KEY = os.getenv("FERNET_KEY")
+        self.NETWORK_INTERFACE = os.getenv("NETWORK_INTERFACE", DEFAULT_INTERFACE)
+
+        self.validate()
+
+    def validate(self):
+        """Validate critical environment variables"""
+        if not all([self.EMAIL_USERNAME, self.EMAIL_PASSWORD, self.FERNET_KEY]):
+            raise EnvironmentError("Critical environment variables are missing. Please check your configuration.")
+
+# Initialize configuration
+config = Config()
 
 # Set file permissions (restrict access)
 os.umask(0o077)
@@ -33,10 +47,10 @@ os.umask(0o077)
 logging.basicConfig(filename="audit_log.txt", level=logging.INFO)
 
 # Encryption setup
-fernet = Fernet(FERNET_KEY)
+fernet = Fernet(config.FERNET_KEY)
 
-# Initialize SQLite database
 def init_db():
+    """Initialize the SQLite database"""
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute('''
             CREATE TABLE IF NOT EXISTS events (
@@ -48,14 +62,15 @@ def init_db():
                 alert_type TEXT
             )
         ''')
+        conn.commit()
 
-# Validate MAC address format
-def validate_mac(mac):
+def validate_mac(mac: str) -> None:
+    """Validate MAC address format"""
     if not re.match(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$", mac):
         raise ValueError("Invalid MAC address format")
 
-# Secure subprocess wrapper
-def run_subprocess(command_list):
+def run_subprocess(command_list: List[str]) -> None:
+    """Run a subprocess command securely"""
     try:
         if not all(re.fullmatch(r'[\w\-/]+', arg) for arg in command_list):
             raise ValueError("Unsafe subprocess argument detected")
@@ -63,26 +78,26 @@ def run_subprocess(command_list):
     except subprocess.CalledProcessError as e:
         logging.error(f"[ERROR] Subprocess failed: {e}")
 
-# Send secure email alert
-def send_email_alert(subject, body):
+def send_email_alert(subject: str, body: str) -> None:
+    """Send a secure email alert"""
     try:
         msg = EmailMessage()
         msg.set_content(body)
         msg["Subject"] = subject
-        msg["From"] = EMAIL_USERNAME
-        msg["To"] = ALERT_RECIPIENT
+        msg["From"] = config.EMAIL_USERNAME
+        msg["To"] = config.ALERT_RECIPIENT
         msg.add_header("X-Mailer", "TrafficMonitor")
 
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        with smtplib.SMTP(config.SMTP_SERVER, config.SMTP_PORT) as server:
             server.starttls()
-            server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+            server.login(config.EMAIL_USERNAME, config.EMAIL_PASSWORD)
             server.send_message(msg)
             logging.info("[INFO] Email alert sent.")
     except Exception as e:
         logging.error(f"[ERROR] Failed to send alert: {e}")
 
-# Load blacklist from encrypted file
-def load_blacklist():
+def load_blacklist() -> List[Dict[str, Any]]:
+    """Load blacklist from encrypted file"""
     if not os.path.exists(BLACKLIST_FILE):
         return []
     with open(BLACKLIST_FILE, 'rb') as f:
@@ -90,15 +105,15 @@ def load_blacklist():
         decrypted_data = fernet.decrypt(encrypted_data)
         return json.loads(decrypted_data.decode())
 
-# Save blacklist securely
-def save_blacklist(blacklist):
+def save_blacklist(blacklist: List[Dict[str, Any]]) -> None:
+    """Save blacklist to an encrypted file"""
     data = json.dumps(blacklist).encode()
     encrypted = fernet.encrypt(data)
     with open(BLACKLIST_FILE, 'wb') as f:
         f.write(encrypted)
 
-# Process packets and log suspicious activity
-def process_packet(packet):
+def process_packet(packet) -> None:
+    """Process captured packets and log suspicious activity"""
     if packet.haslayer(ARP):
         mac = packet[ARP].hwsrc
         ip = packet[ARP].psrc
@@ -120,15 +135,16 @@ def process_packet(packet):
         with sqlite3.connect(DB_FILE) as conn:
             conn.execute("INSERT INTO events (timestamp, mac, ip, vendor, alert_type) VALUES (?, ?, ?, ?, ?)",
                          (timestamp, mac, ip, vendor, alert_type))
+            conn.commit()
 
         send_email_alert("[ALERT] ARP Activity Detected", f"MAC: {mac}\nIP: {ip}\nVendor: {vendor}")
 
-# Main entry point
-def main():
+def main() -> None:
+    """Main entry point for the application"""
     init_db()
     logging.info("[START] Monitoring initialized.")
     try:
-        sniff(iface=INTERFACE, store=False, prn=process_packet)
+        sniff(iface=config.NETWORK_INTERFACE, store=False, prn=process_packet, filter="arp")
     except Exception as e:
         logging.error(f"[ERROR] Packet sniffing failed: {e}")
 
